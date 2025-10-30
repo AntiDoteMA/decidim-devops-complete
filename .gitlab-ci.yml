@@ -1,0 +1,27 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  DOCKER_COMPOSE_VERSION: "1.29.2"
+
+before_script:
+  - echo "Starting CI pipeline for Decidim..."
+  - apt-get update -qq && apt-get install -y -qq docker-compose
+
+build:
+  stage: build
+  script:
+    - echo "Building Decidim app..."
+    - docker-compose pull
+  only:
+    - main
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Deploying Decidim..."
+    - docker-compose down
+    - docker-compose up -d
+  only:
+    - main
