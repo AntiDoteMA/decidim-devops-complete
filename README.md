@@ -9,7 +9,45 @@ This repository contains everything needed to deploy Decidim in a production env
 - Docker & Docker Compose installed
 - GitLab project created
 - GitLab Runner registered on the server
-- Domain name (e.g., decidim.badil2026.net)
+- Domain name (e.g., decidim.DOMAIN_NAME.ext)
+
+---
+
+## 🚦 Getting Started
+
+### First-Time Setup (Recommended)
+
+1. **Follow the Deployment Checklist**
+   ```bash
+   # Read the complete checklist
+   cat DEPLOYMENT_CHECKLIST.md
+   ```
+
+2. **Setup GitLab Runner**
+   - See detailed instructions in `CICD_SETUP.md`
+
+3. **Configure Environment**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your values
+   ```
+
+4. **Push and Deploy**
+   ```bash
+   git push origin main
+   # Then manually trigger deploy_production in GitLab
+   ```
+
+5. **Setup SSL**
+   ```bash
+   sudo certbot --nginx -d your-domain.com
+   ```
+
+### Quick Links
+- 📖 **New to CI/CD?** Start with [CICD_SETUP.md](CICD_SETUP.md)
+- ⚡ **Need quick commands?** Check [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
+- ✅ **Ready to deploy?** Follow [DEPLOYMENT_CHECKLIST.md](DEPLOYMENT_CHECKLIST.md)
+- 🎨 **Want to visualize?** See [WORKFLOW_DIAGRAMS.md](WORKFLOW_DIAGRAMS.md)
 
 ---
 
@@ -39,35 +77,59 @@ Access at: http://localhost:3000
 After confirming the app works, enable SSL:
 ```bash
 sudo apt install certbot python3-certbot-nginx
-sudo certbot --nginx -d decidim.badil2026.net
+sudo certbot --nginx -d decidim.DOMAIN_NAME.ext
 ```
 
 ---
 
-## 🚀 Deploy via GitLab
-Push to the `main` branch to trigger CI/CD:
+## 🚀 Deploy via GitLab CI/CD
+
+### Quick Start
+Push to the `main` branch and manually trigger deployment:
 ```bash
 git add .
 git commit -m "initial deploy"
 git push origin main
 ```
 
-Your GitLab Runner will automatically:
-1. Build containers  
-2. Pull latest Decidim  
-3. Restart the stack
+Then go to **GitLab → CI/CD → Pipelines** and manually trigger the `deploy_production` job.
+
+### Full CI/CD Pipeline Features:
+- ✅ Configuration validation
+- 🚀 Automated deployment with health checks
+- 💾 Automatic backups after deployment
+- ⏪ One-click rollback capability
+- 🏥 Comprehensive health monitoring
+- 📋 Log viewing and diagnostics
+- 🕐 Scheduled daily backups
+
+### Setup Guide
+For complete CI/CD setup instructions, see **[CICD_SETUP.md](CICD_SETUP.md)**
 
 ---
 
-## 🧱 Structure
+## 🧱 Project Structure
 
+### Core Files
 | File | Purpose |
 |------|----------|
-| `docker-compose.yml` | Container definitions |
-| `.gitlab-ci.yml` | GitLab pipeline |
-| `nginx.conf` | Proxy and SSL configuration |
-| `.env` | Environment variables |
-| `README.md` | Deployment guide |
+| `docker-compose.yml` | Container definitions (Decidim, PostgreSQL, Redis, Nginx) |
+| `.gitlab-ci.yml` | Complete CI/CD pipeline with 4 stages |
+| `nginx.conf` | Reverse proxy and SSL configuration |
+| `.env.example` | Environment variables template |
+| `working_fresh_install_script.sh` | Manual installation script |
+| `backup.sh` | Database and uploads backup script |
+| `restore.sh` | Restore from backup script |
+
+### Documentation
+| File | Purpose |
+|------|----------|
+| `README.md` | This file - Quick start guide |
+| `CICD_SETUP.md` | Complete CI/CD setup instructions |
+| `QUICK_REFERENCE.md` | Command reference and cheat sheet |
+| `DEPLOYMENT_CHECKLIST.md` | Step-by-step deployment checklist |
+| `WORKFLOW_DIAGRAMS.md` | Visual workflow diagrams |
+| `IMPLEMENTATION_SUMMARY.md` | Overview of CI/CD features |
 
 ---
 

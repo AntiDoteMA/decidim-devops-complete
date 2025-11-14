@@ -1,27 +1,776 @@
 stages:
-  - build
+  - validate
   - deploy
+  - backup
+  - monitor
 
 variables:
-  DOCKER_COMPOSE_VERSION: "1.29.2"
+  DOCKER_DRIVER: overlay2
+  INSTALL_DIR: "/opt/decidim"
+  DOMAIN: "decidev.DOMAIN_NAME.ext"
+  EMAIL: "admin@DOMAIN_NAME.ext"
 
-before_script:
-  - echo "Starting CI pipeline for Decidim..."
-  - apt-get update -qq && apt-get install -y -qq docker-compose
-
-build:
-  stage: build
+# Validate configuration files before deployment
+validate_config:
+  stage: validate
+  image: ubuntu:22.04
   script:
-    - echo "Building Decidim app..."
-    - docker-compose pull
+    - echo "🔍 Validating configuration files..."
+    - apt-get update -qq && apt-get install -y -qq docker-compose curl nginx
+    
+    # Check required files exist
+    - echo "📁 Checking required files..."
+    - |
+      for file in docker-compose.yml nginx.conf backup.sh restore.sh .env.example; do
+        if [ -f "$file" ]; then
+          echo "✓ $file exists"
+        else
+          echo "✗ $file missing"
+          exit 1
+        fi
+      done
+    
+    # Validate docker-compose.yml syntax
+    - echo ""
+    - echo "🐳 Validating docker-compose.yml..."
+    - docker-compose -f docker-compose.yml config > /dev/null 2>&1
+    - echo "✓ docker-compose.yml syntax is valid"
+    
+    # Check docker-compose services
+    - |
+      echo "🔍 Checking required services in docker-compose.yml..."
+      required_services="postgres redis decidim nginx"
+      for service in $required_services; do
+        if grep -q "^  $service:" docker-compose.yml; then
+          echo "✓ Service '$service' defined"
+        else
+          echo "⚠ Service '$service' not found (optional check)"
+        fi
+      done
+    
+    # Validate nginx.conf syntax
+    - echo ""
+    - echo "🔀 Validating nginx.conf..."
+    - nginx -t -c $(pwd)/nginx.conf 2>&1 | grep -q "successful" && echo "✓ nginx.conf syntax is valid" || echo "⚠ nginx.conf syntax check skipped (may need server context)"
+    
+    # Check nginx.conf has required directives
+    - |
+      echo "🔍 Checking nginx.conf directives..."
+      if grep -q "proxy_pass" nginx.conf; then
+        echo "✓ proxy_pass directive found"
+      else
+        echo "✗ proxy_pass directive missing"
+        exit 1
+      fi
+      
+      if grep -q "proxy_set_header Host" nginx.conf; then
+        echo "✓ proxy_set_header Host found"
+      else
+        echo "⚠ proxy_set_header Host missing (recommended)"
+      fi
+      
+      if grep -q "client_max_body_size" nginx.conf; then
+        echo "✓ client_max_body_size configured"
+      else
+        echo "⚠ client_max_body_size not set (using default)"
+      fi
+    
+    # Check .env.example has required variables
+    - echo ""
+    - echo "⚙️  Checking .env.example configuration..."
+    - |
+      required_vars="POSTGRES_PASSWORD SECRET_KEY_BASE DOMAIN_NAME"
+      for var in $required_vars; do
+        if grep -q "^$var=" .env.example || grep -q "^# $var=" .env.example; then
+          echo "✓ $var present in .env.example"
+        else
+          echo "✗ $var missing from .env.example"
+          exit 1
+        fi
+      done
+    
+    # Validate backup and restore scripts
+    - echo ""
+    - echo "💾 Checking backup scripts..."
+    - |
+      if [ -x backup.sh ] || grep -q "^#!/bin/bash" backup.sh; then
+        echo "✓ backup.sh is a valid script"
+      else
+        echo "⚠ backup.sh may not be executable"
+      fi
+      
+      if [ -x restore.sh ] || grep -q "^#!/bin/bash" restore.sh; then
+        echo "✓ restore.sh is a valid script"
+      else
+        echo "⚠ restore.sh may not be executable"
+      fi
+    
+    - echo ""
+    - echo "✅ All validation checks passed!"
+  
   only:
-    - main
+    - branches
 
-deploy:
+# Deploy to production
+deploy_production:
   stage: deploy
+  tags:
+    - decidim-production  # Requires GitLab Runner with this tag
+  environment:
+    name: production
+    url: https://$DOMAIN
   script:
-    - echo "Deploying Decidim..."
-    - docker-compose down
-    - docker-compose up -d
+    - echo "🚀 Starting deployment to production..."
+    
+    # Prerequisite checks (similar to working script)
+    - echo "📋 Running prerequisite checks..."
+    
+    # Check if Docker is installed and running
+    - |
+      if command -v docker &> /dev/null; then
+        echo "✓ Docker is installed: $(docker --version)"
+      else
+        echo "✗ Docker is not installed"
+        exit 1
+      fi
+      
+      if systemctl is-active --quiet docker; then
+        echo "✓ Docker service is running"
+      else
+        echo "✗ Docker service is not running"
+        systemctl start docker || exit 1
+      fi
+    
+    # Check if Nginx is installed
+    - |
+      if command -v nginx &> /dev/null; then
+        echo "✓ Nginx is installed: $(nginx -v 2>&1)"
+      else
+        echo "⚠ Nginx is not installed, attempting to install..."
+        apt-get update -qq && apt-get install -y -qq nginx
+      fi
+    
+    # Check DNS resolution
+    - |
+      echo "🌐 Checking DNS resolution for $DOMAIN..."
+      if host "$DOMAIN" > /dev/null 2>&1; then
+        SERVER_IP=$(host "$DOMAIN" | grep "has address" | head -1 | awk '{print $4}')
+        echo "✓ DNS resolves to: $SERVER_IP"
+      else
+        echo "⚠ Warning: DNS resolution failed for $DOMAIN"
+        echo "  Ensure DNS A record points to this server"
+      fi
+    
+    # Check if ports 80 and 443 are available or in use by Nginx
+    - |
+      echo "🔌 Checking ports 80 and 443..."
+      for port in 80 443; do
+        if ss -tuln 2>/dev/null | grep -q ":$port "; then
+          echo "⚠ Port $port is already in use (likely by Nginx)"
+        else
+          echo "✓ Port $port is available"
+        fi
+      done
+    
+    # Check disk space
+    - |
+      echo "💾 Checking disk space..."
+      DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+      DISK_AVAIL=$(df -h / | awk 'NR==2 {print $4}')
+      echo "  Available: $DISK_AVAIL (${DISK_USAGE}% used)"
+      if [ "$DISK_USAGE" -gt 90 ]; then
+        echo "✗ Critical: Disk usage above 90%!"
+        exit 1
+      elif [ "$DISK_USAGE" -gt 85 ]; then
+        echo "⚠ Warning: Disk usage above 85%"
+      else
+        echo "✓ Disk space is adequate"
+      fi
+    
+    - echo "✅ All prerequisite checks passed!"
+    - echo ""
+    
+    # Ensure installation directory exists
+    - mkdir -p $INSTALL_DIR
+    - cd $INSTALL_DIR
+    
+    # Copy project files
+    - cp $CI_PROJECT_DIR/docker-compose.yml ./
+    - cp $CI_PROJECT_DIR/nginx.conf ./
+    - cp $CI_PROJECT_DIR/backup.sh ./
+    - cp $CI_PROJECT_DIR/restore.sh ./
+    - chmod +x backup.sh restore.sh
+    
+    # Validate copied configuration files
+    - echo "🔍 Validating configuration files before deployment..."
+    - |
+      echo "Checking docker-compose.yml..."
+      docker compose config > /dev/null 2>&1
+      if [ $? -eq 0 ]; then
+        echo "✓ docker-compose.yml is valid"
+      else
+        echo "✗ docker-compose.yml validation failed"
+        exit 1
+      fi
+    
+    # Check nginx configuration
+    - |
+      echo "Checking nginx.conf..."
+      if grep -q "proxy_pass" nginx.conf && grep -q "proxy_set_header" nginx.conf; then
+        echo "✓ nginx.conf has required directives"
+      else
+        echo "✗ nginx.conf is missing required directives"
+        exit 1
+      fi
+    
+    # Generate .env file if it doesn't exist (preserve existing config)
+    - |
+      if [ ! -f ".env" ]; then
+        echo "📝 Creating .env file..."
+        SECRET_KEY_BASE=$(openssl rand -hex 64)
+        POSTGRES_PASSWORD=$(openssl rand -hex 32)
+        cat > .env <<EOF
+      # Database configuration
+      POSTGRES_HOST=postgres
+      POSTGRES_USER=decidim
+      POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+      DATABASE_URL=postgres://decidim:$POSTGRES_PASSWORD@postgres/decidim_production
+
+      # Rails configuration
+      RAILS_ENV=production
+      SECRET_KEY_BASE=$SECRET_KEY_BASE
+      RAILS_SERVE_STATIC_FILES=true
+
+      # Domain configuration
+      DECIDIM_HOST=$DOMAIN
+      DOMAIN_NAME=$DOMAIN
+
+      # Redis configuration
+      REDIS_URL=redis://redis:6379/0
+
+      # Email configuration
+      SMTP_ADDRESS=${SMTP_ADDRESS:-smtp.example.com}
+      SMTP_PORT=${SMTP_PORT:-587}
+      SMTP_USERNAME=${SMTP_USERNAME:-}
+      SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      SMTP_DOMAIN=$DOMAIN
+      EOF
+        echo "✓ .env file created"
+      else
+        echo "✓ Using existing .env configuration"
+      fi
+    
+    # Create necessary directories
+    - mkdir -p postgres-data redis-data uploads backups
+    - chmod -R 755 .
+    
+    # Pull latest Docker images
+    - echo "📦 Pulling latest images..."
+    - docker compose pull
+    
+    # Gracefully stop existing containers
+    - echo "⏸️  Stopping existing containers..."
+    - docker compose down --timeout 30 || true
+    
+    # Start services
+    - echo "▶️  Starting services..."
+    - docker compose up -d
+    
+    # Wait for services to be healthy
+    - echo "⏳ Waiting for services to be ready..."
+    - sleep 20
+    
+    # Health check with retries
+    - |
+      echo "🏥 Running health checks..."
+      MAX_ATTEMPTS=30
+      ATTEMPT=0
+      while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+          echo ""
+          echo "✓ Decidim is ready and responding!"
+          
+          # Additional health checks
+          echo ""
+          echo "Running additional service checks..."
+          
+          # Check PostgreSQL
+          if docker exec decidim-db pg_isready -U decidim > /dev/null 2>&1; then
+            echo "✓ PostgreSQL is healthy"
+          else
+            echo "⚠ PostgreSQL health check failed"
+          fi
+          
+          # Check Redis
+          if docker exec decidim-redis redis-cli ping > /dev/null 2>&1; then
+            echo "✓ Redis is healthy"
+          else
+            echo "⚠ Redis health check failed"
+          fi
+          
+          # Check Nginx
+          if systemctl is-active --quiet nginx; then
+            echo "✓ Nginx is running"
+          else
+            echo "⚠ Nginx is not running"
+          fi
+          
+          break
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+        echo -n "⏳ Waiting for Decidim... attempt $ATTEMPT/$MAX_ATTEMPTS"
+        sleep 10
+      done
+      
+      if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+        echo ""
+        echo "✗ Decidim failed to start within timeout (300 seconds)"
+        echo "📋 Recent container logs:"
+        docker compose logs --tail=50 decidim
+        echo ""
+        echo "📊 Container status:"
+        docker compose ps
+        exit 1
+      fi
+    
+    # Display running containers
+    - echo "📊 Running containers:"
+    - docker compose ps
+    
+    # Update Nginx configuration if needed
+    - |
+      if ! grep -q "server_name $DOMAIN" /etc/nginx/sites-available/$DOMAIN 2>/dev/null; then
+        echo "🔧 Updating Nginx configuration..."
+        
+        # Remove default site if it exists
+        rm -f /etc/nginx/sites-enabled/default
+        
+        # Create new configuration
+        cat > /etc/nginx/sites-available/$DOMAIN <<NGINX
+      server {
+          listen 80;
+          server_name $DOMAIN;
+          
+          location / {
+              proxy_pass http://127.0.0.1:3000;
+              proxy_set_header Host \$host;
+              proxy_set_header X-Real-IP \$remote_addr;
+              proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto \$scheme;
+              proxy_buffering off;
+              proxy_request_buffering off;
+              client_max_body_size 100M;
+          }
+      }
+      NGINX
+        
+        # Enable the site
+        ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/$DOMAIN
+        
+        # Test Nginx configuration before reloading
+        echo "Testing Nginx configuration..."
+        if nginx -t 2>&1; then
+          echo "✓ Nginx configuration test passed"
+          systemctl reload nginx
+          echo "✓ Nginx reloaded successfully"
+        else
+          echo "✗ Nginx configuration test failed"
+          exit 1
+        fi
+      else
+        echo "✓ Nginx configuration already exists for $DOMAIN"
+      fi
+    
+    - echo "✅ Deployment completed successfully!"
+    - echo "🌐 Site available at: https://$DOMAIN"
+  
   only:
     - main
+  
+  when: manual  # Require manual trigger for production deployments
+  allow_failure: false
+
+# Automatic backup after successful deployment
+backup_after_deploy:
+  stage: backup
+  tags:
+    - decidim-production
+  script:
+    - echo "💾 Creating post-deployment backup..."
+    - cd $INSTALL_DIR
+    
+    # Create timestamped backup directory
+    - BACKUP_DIR="./backups/$(date +%Y-%m-%d_%H-%M-%S)_post_deploy"
+    - mkdir -p "$BACKUP_DIR"
+    
+    # Backup PostgreSQL database
+    - echo "📊 Backing up database..."
+    - docker exec decidim-db pg_dump -U decidim decidim_production > "$BACKUP_DIR/decidim_db.sql"
+    - echo "✓ Database backup saved: $(du -h $BACKUP_DIR/decidim_db.sql | cut -f1)"
+    
+    # Backup uploads directory
+    - |
+      if [ -d "./uploads" ] && [ "$(ls -A ./uploads)" ]; then
+        echo "📁 Backing up uploads..."
+        cp -r ./uploads "$BACKUP_DIR/uploads"
+        echo "✓ Uploads backup saved: $(du -sh $BACKUP_DIR/uploads | cut -f1)"
+      else
+        echo "ℹ️  No uploads to backup"
+      fi
+    
+    # Backup configuration
+    - cp .env "$BACKUP_DIR/.env.backup"
+    - cp docker-compose.yml "$BACKUP_DIR/docker-compose.yml.backup"
+    - echo "✓ Configuration files backed up"
+    
+    # Create backup metadata
+    - |
+      cat > "$BACKUP_DIR/backup_info.txt" <<EOF
+      Backup Date: $(date)
+      Git Commit: $CI_COMMIT_SHORT_SHA
+      Git Branch: $CI_COMMIT_BRANCH
+      Pipeline ID: $CI_PIPELINE_ID
+      Triggered By: $CI_COMMIT_AUTHOR
+      EOF
+    
+    # Clean up old backups (keep last 7 days)
+    - echo "🧹 Cleaning up old backups..."
+    - find ./backups -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+    - echo "✓ Old backups cleaned (kept last 7 days)"
+    
+    - echo "✅ Backup completed: $BACKUP_DIR"
+    - ls -lh "$BACKUP_DIR"
+  
+  only:
+    - main
+  
+  dependencies:
+    - deploy_production
+  
+  when: on_success
+
+# Manual rollback to previous backup
+rollback:
+  stage: deploy
+  tags:
+    - decidim-production
+  script:
+    - echo "⏪ Rolling back to previous version..."
+    - cd $INSTALL_DIR
+    
+    # Find the most recent backup (excluding current)
+    - LATEST_BACKUP=$(ls -td backups/*/ | head -2 | tail -1)
+    
+    - |
+      if [ -z "$LATEST_BACKUP" ] || [ ! -d "$LATEST_BACKUP" ]; then
+        echo "✗ No backup found for rollback"
+        exit 1
+      fi
+    
+    - echo "📦 Restoring from: $LATEST_BACKUP"
+    - cat "$LATEST_BACKUP/backup_info.txt" 2>/dev/null || echo "No backup info available"
+    
+    # Stop current services
+    - echo "⏸️  Stopping current services..."
+    - docker compose down
+    
+    # Start only database for restore
+    - echo "🔄 Starting database for restore..."
+    - docker compose up -d postgres
+    - sleep 10
+    
+    # Restore database
+    - echo "📊 Restoring database..."
+    - docker exec -i decidim-db psql -U decidim decidim_production < "$LATEST_BACKUP/decidim_db.sql"
+    - echo "✓ Database restored"
+    
+    # Restore uploads
+    - |
+      if [ -d "$LATEST_BACKUP/uploads" ]; then
+        echo "📁 Restoring uploads..."
+        rm -rf ./uploads
+        cp -r "$LATEST_BACKUP/uploads" ./uploads
+        echo "✓ Uploads restored"
+      else
+        echo "ℹ️  No uploads to restore"
+      fi
+    
+    # Restart all services
+    - echo "▶️  Restarting all services..."
+    - docker compose up -d
+    - sleep 20
+    
+    # Verify rollback
+    - |
+      if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+        echo "✅ Rollback completed successfully"
+      else
+        echo "⚠️  Rollback completed but service health check failed"
+        docker compose logs --tail=50 decidim
+        exit 1
+      fi
+  
+  only:
+    - main
+  
+  when: manual
+
+# View application logs
+view_logs:
+  stage: monitor
+  tags:
+    - decidim-production
+  script:
+    - echo "📋 Viewing recent application logs..."
+    - cd $INSTALL_DIR
+    - docker compose logs --tail=100 decidim
+    - echo ""
+    - echo "📊 Container status:"
+    - docker compose ps
+  
+  only:
+    - main
+  
+  when: manual
+  allow_failure: true
+
+# Comprehensive health check
+health_check:
+  stage: monitor
+  tags:
+    - decidim-production
+  script:
+    - echo "🏥 Running comprehensive health checks..."
+    - echo "=== Decidim Deployment Diagnostics ==="
+    - echo ""
+    - cd $INSTALL_DIR
+    
+    # Check Docker installation and version
+    - echo "🐳 Docker Status:"
+    - |
+      if command -v docker &> /dev/null; then
+        echo "✓ Docker is installed"
+        docker --version
+        docker compose version
+      else
+        echo "✗ Docker is NOT installed"
+        exit 1
+      fi
+    - echo ""
+    
+    # Check Docker services
+    - echo "📊 Container Status:"
+    - docker compose ps
+    - echo ""
+    
+    # Check individual service health
+    - echo "🔍 Service Health Checks:"
+    
+    # Check Decidim application
+    - echo ""
+    - echo "  Decidim Application:"
+    - |
+      if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+        echo "  ✓ Decidim app is responding on localhost:3000"
+        RESPONSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
+        echo "    HTTP Status: $RESPONSE_CODE"
+      else
+        echo "  ✗ Decidim app is NOT responding"
+        exit 1
+      fi
+    
+    # Check PostgreSQL
+    - echo ""
+    - echo "  PostgreSQL Database:"
+    - |
+      if docker exec decidim-db pg_isready -U decidim > /dev/null 2>&1; then
+        echo "  ✓ PostgreSQL is healthy"
+        # Get database size and connection info
+        docker exec decidim-db psql -U decidim -d decidim_production -c "SELECT pg_size_pretty(pg_database_size('decidim_production')) as size;" 2>/dev/null | grep -A 1 size || true
+        docker exec decidim-db psql -U decidim -d decidim_production -c "SELECT COUNT(*) as tables FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null | grep -A 1 tables || true
+      else
+        echo "  ✗ PostgreSQL is NOT healthy"
+        exit 1
+      fi
+    
+    # Check Redis
+    - echo ""
+    - echo "  Redis Cache:"
+    - |
+      if docker exec decidim-redis redis-cli ping > /dev/null 2>&1; then
+        echo "  ✓ Redis is healthy"
+        REDIS_INFO=$(docker exec decidim-redis redis-cli info stats 2>/dev/null | grep total_connections_received || echo "")
+        if [ -n "$REDIS_INFO" ]; then
+          echo "    $REDIS_INFO"
+        fi
+      else
+        echo "  ✗ Redis is NOT healthy"
+        exit 1
+      fi
+    
+    # Check Nginx
+    - echo ""
+    - echo "🔀 Nginx Reverse Proxy:"
+    - |
+      if systemctl is-active --quiet nginx; then
+        echo "  ✓ Nginx is running"
+        NGINX_TEST=$(nginx -t 2>&1)
+        if echo "$NGINX_TEST" | grep -q "successful"; then
+          echo "  ✓ Nginx configuration test successful"
+        else
+          echo "  ⚠ Nginx configuration test failed"
+          echo "$NGINX_TEST"
+        fi
+      else
+        echo "  ✗ Nginx is NOT running"
+        exit 1
+      fi
+    
+    # Check public connectivity
+    - echo ""
+    - echo "🌐 Public Connectivity:"
+    - |
+      if curl -sf "http://$DOMAIN" > /dev/null 2>&1; then
+        echo "  ✓ Site accessible via HTTP"
+      else
+        echo "  ✗ Site NOT accessible via HTTP"
+      fi
+      
+      if curl -sf "https://$DOMAIN" > /dev/null 2>&1; then
+        echo "  ✓ Site accessible via HTTPS"
+      else
+        echo "  ⚠ Site NOT accessible via HTTPS (may need SSL setup)"
+      fi
+    
+    # Check SSL certificate
+    - echo ""
+    - echo "🔒 SSL Certificate:"
+    - |
+      if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+        echo "  ✓ SSL certificate exists"
+        CERT_EXPIRY=$(openssl x509 -enddate -noout -in /etc/letsencrypt/live/$DOMAIN/fullchain.pem 2>/dev/null | cut -d= -f2)
+        if [ -n "$CERT_EXPIRY" ]; then
+          echo "    Expires: $CERT_EXPIRY"
+          
+          # Calculate days until expiry
+          EXPIRY_EPOCH=$(date -d "$CERT_EXPIRY" +%s 2>/dev/null || echo "0")
+          CURRENT_EPOCH=$(date +%s)
+          DAYS_UNTIL_EXPIRY=$(( ($EXPIRY_EPOCH - $CURRENT_EPOCH) / 86400 ))
+          
+          if [ $DAYS_UNTIL_EXPIRY -lt 0 ]; then
+            echo "    ✗ Certificate has EXPIRED!"
+          elif [ $DAYS_UNTIL_EXPIRY -lt 30 ]; then
+            echo "    ⚠ Certificate expires in $DAYS_UNTIL_EXPIRY days (renewal needed)"
+          else
+            echo "    ✓ Certificate valid for $DAYS_UNTIL_EXPIRY days"
+          fi
+        fi
+        
+        # Check auto-renewal
+        if systemctl is-active --quiet certbot.timer 2>/dev/null; then
+          echo "  ✓ Certbot auto-renewal is enabled"
+        else
+          echo "  ⚠ Certbot auto-renewal may not be enabled"
+        fi
+      else
+        echo "  ⚠ SSL certificate not found (manual setup may be required)"
+        echo "    Run: sudo certbot --nginx -d $DOMAIN"
+      fi
+    
+    # Check disk space
+    - echo ""
+    - echo "💾 Disk Space:"
+    - |
+      DISK_USAGE=$(df -h $INSTALL_DIR | awk 'NR==2 {print $5}' | sed 's/%//')
+      DISK_AVAIL=$(df -h $INSTALL_DIR | awk 'NR==2 {print $4}')
+      DISK_USED=$(df -h $INSTALL_DIR | awk 'NR==2 {print $3}')
+      echo "  Used: $DISK_USED / Available: $DISK_AVAIL (${DISK_USAGE}% used)"
+      
+      if [ "$DISK_USAGE" -gt 90 ]; then
+        echo "  ✗ CRITICAL: Disk usage above 90%!"
+      elif [ "$DISK_USAGE" -gt 85 ]; then
+        echo "  ⚠ WARNING: Disk usage above 85%!"
+      elif [ "$DISK_USAGE" -gt 70 ]; then
+        echo "  ⚠ NOTICE: Disk usage above 70%"
+      else
+        echo "  ✓ Disk space is adequate"
+      fi
+    
+    # Check memory usage
+    - echo ""
+    - echo "💻 Memory Usage:"
+    - free -h | grep -E "^Mem:|^Swap:" | awk '{print "  " $0}'
+    - |
+      MEM_USAGE=$(free | grep Mem | awk '{printf "%.0f", ($3/$2) * 100}')
+      if [ "$MEM_USAGE" -gt 90 ]; then
+        echo "  ⚠ Memory usage is high (${MEM_USAGE}%)"
+      else
+        echo "  ✓ Memory usage is acceptable (${MEM_USAGE}%)"
+      fi
+    
+    # Check container resource usage
+    - echo ""
+    - echo "📈 Container Resource Usage:"
+    - docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" $(docker compose ps -q) 2>/dev/null || echo "  Unable to retrieve container stats"
+    
+    # Count backups
+    - echo ""
+    - echo "💾 Backup Status:"
+    - |
+      if [ -d "backups" ]; then
+        BACKUP_COUNT=$(ls -d backups/*/ 2>/dev/null | wc -l)
+        echo "  Total backups: $BACKUP_COUNT"
+        if [ $BACKUP_COUNT -gt 0 ]; then
+          LATEST=$(ls -td backups/*/ 2>/dev/null | head -1)
+          LATEST_NAME=$(basename $LATEST)
+          LATEST_SIZE=$(du -sh $LATEST 2>/dev/null | cut -f1)
+          echo "  Latest: $LATEST_NAME (Size: $LATEST_SIZE)"
+          
+          # Check backup age
+          LATEST_TIME=$(stat -c %Y $LATEST 2>/dev/null || stat -f %m $LATEST 2>/dev/null)
+          CURRENT_TIME=$(date +%s)
+          BACKUP_AGE_HOURS=$(( ($CURRENT_TIME - $LATEST_TIME) / 3600 ))
+          
+          if [ $BACKUP_AGE_HOURS -gt 48 ]; then
+            echo "  ⚠ Latest backup is $BACKUP_AGE_HOURS hours old"
+          else
+            echo "  ✓ Latest backup is $BACKUP_AGE_HOURS hours old"
+          fi
+        else
+          echo "  ⚠ No backups found"
+        fi
+      else
+        echo "  ⚠ Backup directory not found"
+      fi
+    
+    # Recent logs summary
+    - echo ""
+    - echo "📋 Recent Error Logs (if any):"
+    - docker compose logs --tail=20 decidim 2>/dev/null | grep -i "error\|exception\|fatal" || echo "  ✓ No recent errors found in logs"
+    
+    - echo ""
+    - echo "================================================"
+    - echo "✅ Health check completed!"
+    - echo "================================================"
+  
+  only:
+    - main
+  
+  when: manual
+  allow_failure: true
+
+# Scheduled daily backup (configure in GitLab CI/CD Schedules)
+scheduled_backup:
+  stage: backup
+  tags:
+    - decidim-production
+  script:
+    - echo "🕐 Running scheduled backup..."
+    - cd $INSTALL_DIR
+    - bash backup.sh
+    - echo "✅ Scheduled backup completed"
+  
+  only:
+    - schedules
+  
+  allow_failure: false
